@@ -45,7 +45,8 @@ GLOBAL_STATE = {
     'last_prediction': None, 'last_prediction_times': None,
     'shap_values': None, 'shap_flat_names': None, 'shap_mean_abs': None,
     'shap_target': None, 'shap_horizon': None,
-    'raw_df': None, 'missing_mask': None
+    'raw_df': None, 'missing_mask': None,
+    'shock_sim_result': None,
 }
 
 COLOR_PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
@@ -586,12 +587,93 @@ REPORT_LAYOUT = html.Div([
 ])
 
 
+SHOCK_SIM_LAYOUT = html.Div([
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader('💥 冲击场景配置', className='bg-danger text-white'),
+                dbc.CardBody([
+                    html.Div([
+                        dbc.Label('冲击开始时刻（从已加载数据中选择）'),
+                        dcc.Dropdown(
+                            id='shock-start-time',
+                            options=[], placeholder='请先加载数据',
+                            className='mb-3'
+                        ),
+                    ]),
+                    html.Div([
+                        dbc.Label('冲击持续时长（小时）'),
+                        dcc.Dropdown(
+                            id='shock-duration',
+                            options=[{'label': f'{h} 小时', 'value': h} for h in range(1, 13)],
+                            value=4, clearable=False, className='mb-3'
+                        ),
+                    ]),
+                    html.Div([
+                        dbc.Label('冲击倍率（进水浓度相对基线的倍数）'),
+                        dcc.Dropdown(
+                            id='shock-multiplier',
+                            options=[{'label': f'{m:.1f} 倍', 'value': m}
+                                     for m in [round(x * 0.5, 1) for x in range(3, 11)]],
+                            value=2.0, clearable=False, className='mb-3'
+                        ),
+                    ]),
+                    html.Hr(),
+                    dbc.Button('🚀 运行模拟', id='run-shock-sim-btn', color='danger',
+                               className='w-100'),
+                    dcc.Loading(id='shock-sim-loading', type='circle',
+                                children=html.Div(id='shock-sim-status', className='mt-3')),
+                ])
+            ])
+        ], width=3),
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader('📈 模拟出水指标轨迹', className='bg-light'),
+                dbc.CardBody([
+                    dcc.Graph(id='shock-sim-chart', style={'height': '400px'})
+                ])
+            ], className='mb-3'),
+            dbc.Card([
+                dbc.CardHeader('⚠️ 超标预测详情', className='bg-light'),
+                dbc.CardBody([
+                    dash_table.DataTable(
+                        id='shock-violation-table',
+                        columns=[
+                            {'name': '时刻', 'id': '时刻'},
+                            {'name': '超标指标', 'id': '超标指标'},
+                            {'name': '预测值(mg/L)', 'id': '预测值'},
+                            {'name': '国标限值(mg/L)', 'id': '国标限值'},
+                            {'name': '超标幅度(%)', 'id': '超标幅度'},
+                        ],
+                        data=[],
+                        style_table={'overflowX': 'auto'},
+                        style_header={'backgroundColor': '#fadbd8', 'fontWeight': 'bold'},
+                        style_cell={'textAlign': 'center', 'padding': '6px', 'fontSize': '12px'},
+                        sort_action='native',
+                        page_size=15
+                    )
+                ])
+            ], className='mb-3'),
+            dbc.Card([
+                dbc.CardHeader('🔧 联动工艺优化 — 应急调控方案', className='bg-light'),
+                dbc.CardBody([
+                    dbc.Button('生成应急调控方案', id='gen-emergency-plan-btn',
+                               color='warning', className='mb-3', disabled=True),
+                    html.Div(id='emergency-plan-result')
+                ])
+            ])
+        ], width=9),
+    ], className='mb-4')
+])
+
+
 TABS_IDS = ['tab-overview', 'tab-prediction', 'tab-warning', 'tab-optimization',
-            'tab-energy', 'tab-sludge', 'tab-seasonal', 'tab-report']
+            'tab-energy', 'tab-sludge', 'tab-seasonal', 'tab-report', 'tab-shock-sim']
 
 app.layout = html.Div([
     header(),
     dcc.Store(id='last-model-store', data=None),
+    dcc.Store(id='shock-sim-store', data=None),
     dbc.Container([
         dbc.Tabs([
             dbc.Tab(OVERVIEW_LAYOUT, label='📊 数据概览', tab_id='tab-overview'),
@@ -602,6 +684,7 @@ app.layout = html.Div([
             dbc.Tab(SLUDGE_LAYOUT, label='🧪 污泥管理', tab_id='tab-sludge'),
             dbc.Tab(SEASONAL_LAYOUT, label='🌡️ 季节对比', tab_id='tab-seasonal'),
             dbc.Tab(REPORT_LAYOUT, label='📄 报告导出', tab_id='tab-report'),
+            dbc.Tab(SHOCK_SIM_LAYOUT, label='💥 冲击模拟', tab_id='tab-shock-sim'),
         ], id='main-tabs', active_tab='tab-overview', className='mb-4', persistence=True),
     ], fluid=True)
 ])
@@ -621,6 +704,7 @@ app.layout = html.Div([
     Output('dq-missing-list', 'children'),
     Output('dq-outlier-total', 'children'),
     Output('dq-outlier-list', 'children'),
+    Output('shock-start-time', 'options'),
     Input('upload-data', 'contents'),
     State('upload-data', 'filename'),
     State('upload-data', 'last_modified'),
@@ -673,6 +757,11 @@ def handle_upload(contents, filename, last_modified, sample_n):
         warn_opts = [{'label': t.strftime('%Y-%m-%d %H:00'), 'value': i} for i, t in enumerate(times)]
         dates = sorted(set(t.strftime('%Y-%m-%d') for t in pd.to_datetime(df[time_col])))
         date_opts = [{'label': d, 'value': d} for d in dates]
+        min_prior_hours = 48
+        min_following_hours = 12 + 4
+        shock_opts = [{'label': t.strftime('%Y-%m-%d %H:00'), 'value': i}
+                      for i, t in enumerate(times)
+                      if i >= min_prior_hours and i + min_following_hours <= len(times)]
 
         n_records = len(df_raw)
         total_cells = n_records * len(numeric_cols_raw)
@@ -755,7 +844,8 @@ def handle_upload(contents, filename, last_modified, sample_n):
                           style={'color': '#e74c3c' if total_outliers > 0 else '#27ae60'}),
                 html.Span(f' 个 / {total_cells} 个', className='text-muted')
             ]),
-            outlier_list
+            outlier_list,
+            shock_opts
         )
 
     except Exception as e:
@@ -766,7 +856,8 @@ def handle_upload(contents, filename, last_modified, sample_n):
         return (
             html.Div(f'❌ 错误: {str(e)}', className='text-danger'),
             [], [], [], [], [], [],
-            '-', '-', '-', html.Div(), '-', html.Div()
+            '-', '-', '-', html.Div(), '-', html.Div(),
+            []
         )
 
 
@@ -1905,6 +1996,332 @@ def export_report(n_clicks, date_str, warn_idx):
     except Exception as e:
         import traceback
         return dict(content=str(e), filename='error.txt', type='text/plain')
+
+
+@app.callback(
+    Output('shock-sim-status', 'children'),
+    Output('shock-sim-chart', 'figure'),
+    Output('shock-violation-table', 'data'),
+    Output('shock-sim-store', 'data'),
+    Output('gen-emergency-plan-btn', 'disabled'),
+    Input('run-shock-sim-btn', 'n_clicks'),
+    State('shock-start-time', 'value'),
+    State('shock-duration', 'value'),
+    State('shock-multiplier', 'value'),
+    prevent_initial_call=True
+)
+def run_shock_simulation(n_clicks, start_idx, duration, multiplier):
+    if GLOBAL_STATE.get('lstm_model') is None and GLOBAL_STATE.get('xgb_model') is None:
+        return html.Div('⚠️ 请先在出水预测页面训练模型', className='text-warning'), \
+               go.Figure(), [], None, True
+    if GLOBAL_STATE['df'] is None:
+        return html.Div('⚠️ 请先加载数据', className='text-warning'), \
+               go.Figure(), [], None, True
+    if start_idx is None:
+        return html.Div('⚠️ 请选择冲击开始时刻', className='text-warning'), \
+               go.Figure(), [], None, True
+
+    try:
+        df = GLOBAL_STATE['df'].copy()
+        time_col = GLOBAL_STATE['time_col']
+        lookback = 24
+        duration = int(duration or 4)
+        multiplier = float(multiplier or 2.0)
+        start_idx = int(start_idx)
+
+        min_required_before = lookback + 24
+        min_required_after = duration + 4
+        if start_idx < min_required_before:
+            return html.Div(f'⚠️ 冲击开始时刻前需至少有{min_required_before}小时数据（当前{start_idx}小时）', className='text-warning'), \
+                   go.Figure(), [], None, True
+        if start_idx + min_required_after > len(df):
+            max_allowed_start = len(df) - min_required_after
+            return html.Div(f'⚠️ 冲击开始时刻后需至少有{min_required_after}小时数据（冲击时长{duration}h+恢复期4h），请选择更早的时刻', className='text-warning'), \
+                   go.Figure(), [], None, True
+
+        model_type = GLOBAL_STATE.get('last_model_type', 'lstm')
+        predict_fn = _get_predict_fn(model_type)
+        feature_cols = [c for c in INFLOW_INDICATORS + PROCESS_PARAMS if c in df.columns]
+
+        baseline_window = df.iloc[start_idx - 24:start_idx]
+        baseline_cod = baseline_window['COD_in'].mean()
+        baseline_tn = baseline_window['TN_in'].mean()
+        baseline_tp = baseline_window['TP_in'].mean()
+
+        total_hours = duration + 4
+        end_idx = start_idx + total_hours
+
+        times = pd.to_datetime(df.iloc[start_idx:end_idx][time_col]).tolist()
+
+        predictions_all = []
+        cod_in_col_idx = feature_cols.index('COD_in')
+        tn_in_col_idx = feature_cols.index('TN_in')
+        tp_in_col_idx = feature_cols.index('TP_in')
+        shock_start_data_idx = start_idx
+        shock_end_data_idx = start_idx + duration
+
+        for step in range(total_hours):
+            window_start = start_idx + step - lookback
+            window_end = start_idx + step
+            if window_start < 0 or window_end > len(df):
+                break
+
+            state_window = df.iloc[window_start:window_end][feature_cols].values.astype(np.float32).copy()
+
+            for t_in_window in range(lookback):
+                actual_data_idx = window_start + t_in_window
+                if shock_start_data_idx <= actual_data_idx < shock_end_data_idx:
+                    state_window[t_in_window, cod_in_col_idx] = baseline_cod * multiplier
+                    state_window[t_in_window, tn_in_col_idx] = baseline_tn * multiplier
+                    state_window[t_in_window, tp_in_col_idx] = baseline_tp * multiplier
+
+            X_input = state_window.reshape(1, lookback, -1)
+            pred = predict_fn(X_input)[0]
+            predictions_all.append(pred[0].tolist())
+
+        if not predictions_all:
+            return html.Div('❌ 模拟计算失败，数据范围不足', className='text-danger'), \
+                   go.Figure(), [], None, True
+
+        pred_arr = np.array(predictions_all)
+        n_actual = len(pred_arr)
+        actual_times = times[:n_actual]
+
+        fig = go.Figure()
+        indicator_colors = {'COD_out': '#1f77b4', 'TN_out': '#ff7f0e', 'TP_out': '#2ca02c'}
+        standards = {'COD_out': 50, 'TN_out': 15, 'TP_out': 0.5}
+
+        for i, name in enumerate(KEY_PREDICTORS):
+            vals = pred_arr[:, i]
+            color = indicator_colors.get(name, '#333')
+            std = standards[name]
+
+            normal_vals = np.where(vals <= std, vals, np.nan)
+            exceed_vals = np.where(vals > std, vals, np.nan)
+
+            fig.add_trace(go.Scatter(
+                x=actual_times, y=normal_vals, mode='lines+markers',
+                name=DISPLAY_NAMES.get(name, name),
+                line=dict(color=color, width=2),
+                marker=dict(size=4),
+                connectgaps=True
+            ))
+            fig.add_trace(go.Scatter(
+                x=actual_times, y=exceed_vals, mode='lines+markers',
+                name=f'{DISPLAY_NAMES.get(name, name)} (超标)',
+                line=dict(color='#d62728', width=2.5),
+                marker=dict(size=5, symbol='x'),
+                connectgaps=True
+            ))
+            fig.add_hline(y=std, line_dash='dash', line_color='grey', opacity=0.7,
+                          annotation_text=f'{DISPLAY_NAMES.get(name, name)} 国标 {std}',
+                          annotation_position='top right', annotation_font_size=10)
+
+        if len(actual_times) >= 2:
+            shock_end_time = actual_times[0] + timedelta(hours=duration)
+            fig.add_vrect(
+                x0=actual_times[0], x1=shock_end_time,
+                fillcolor='#e74c3c', opacity=0.08,
+                layer='below', line_width=0,
+                annotation_text='冲击时段', annotation_position='top left',
+                annotation_font_color='#d62728', annotation_font_size=11
+            )
+
+        fig.update_layout(
+            title='冲击负荷模拟 — 出水COD/TN/TP预测轨迹',
+            template='plotly_white', hovermode='x unified',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            yaxis_title='浓度 (mg/L)',
+            margin=dict(l=60, r=20, t=80, b=60),
+            xaxis_tickangle=45
+        )
+
+        violation_rows = []
+        for step in range(n_actual):
+            for i, name in enumerate(KEY_PREDICTORS):
+                val = float(pred_arr[step, i])
+                std = standards[name]
+                if val > std:
+                    exceed_pct = (val - std) / std * 100
+                    t_str = actual_times[step].strftime('%Y-%m-%d %H:00') if step < len(actual_times) else 'N/A'
+                    violation_rows.append({
+                        '时刻': t_str,
+                        '超标指标': DISPLAY_NAMES.get(name, name),
+                        '预测值': f'{val:.3f}',
+                        '国标限值': f'{std}',
+                        '超标幅度': f'{exceed_pct:.1f}%'
+                    })
+
+        violation_rows.sort(key=lambda x: float(x['超标幅度'].rstrip('%')), reverse=True)
+
+        peak_step = 0
+        if pred_arr.shape[0] > 0:
+            total_exceed = np.sum([pred_arr[:, i] - standards[name]
+                                   for i, name in enumerate(KEY_PREDICTORS)
+                                   if name in standards], axis=0)
+            peak_step = int(np.argmax(total_exceed))
+
+        peak_time_str = actual_times[peak_step].strftime('%Y-%m-%d %H:00') if peak_step < len(actual_times) else ''
+        shock_peak_idx = start_idx + peak_step
+
+        sim_result = {
+            'peak_idx': shock_peak_idx,
+            'peak_time': peak_time_str,
+            'duration': duration,
+            'multiplier': multiplier,
+            'start_idx': start_idx,
+        }
+        GLOBAL_STATE['shock_sim_result'] = sim_result
+
+        status = html.Div([
+            html.P('✅ 模拟完成', className='text-success fw-bold', style={'margin': '2px 0'}),
+            html.P(f'基线: COD={baseline_cod:.1f}, TN={baseline_tn:.1f}, TP={baseline_tp:.2f} mg/L',
+                   style={'margin': '2px 0', 'fontSize': '12px'}, className='text-muted'),
+            html.P(f'冲击: {multiplier}×持续{duration}h | 超标{len(violation_rows)}条 | 恢复期4h',
+                   style={'margin': '2px 0', 'fontSize': '12px'}, className='text-muted'),
+        ])
+
+        return status, fig, violation_rows, sim_result, False
+
+    except Exception as e:
+        import traceback
+        return html.Div(f'❌ 模拟出错: {str(e)}', className='text-danger'), \
+               go.Figure(), [], None, True
+
+
+@app.callback(
+    Output('emergency-plan-result', 'children'),
+    Input('gen-emergency-plan-btn', 'n_clicks'),
+    State('shock-sim-store', 'data'),
+    prevent_initial_call=True
+)
+def generate_emergency_plan(n_clicks, sim_data):
+    if sim_data is None:
+        return html.Div('⚠️ 请先运行冲击模拟', className='text-warning')
+
+    if GLOBAL_STATE.get('lstm_model') is None and GLOBAL_STATE.get('xgb_model') is None:
+        return html.Div('⚠️ 请先在出水预测页面训练模型', className='text-warning')
+
+    try:
+        df = GLOBAL_STATE['df']
+        lookback = 24
+        peak_idx = sim_data['peak_idx']
+
+        if peak_idx < lookback or peak_idx >= len(df):
+            return html.Div('⚠️ 冲击高峰时刻数据不足', className='text-warning')
+
+        model_type = GLOBAL_STATE.get('last_model_type', 'lstm')
+        predict_fn = _get_predict_fn(model_type)
+        feature_cols = [c for c in INFLOW_INDICATORS + PROCESS_PARAMS if c in df.columns]
+        current_state = df.iloc[peak_idx - lookback:peak_idx][feature_cols].values.astype(np.float32)
+
+        current_params = {
+            '曝气量': float(df.iloc[peak_idx].get('曝气量', 5000)),
+            '污泥回流比': float(df.iloc[peak_idx].get('污泥回流比', 100)),
+            '碳源投加量': float(df.iloc[peak_idx].get('碳源投加量', 80)),
+        }
+
+        opt_result = optimize_process(
+            predict_fn, current_state, current_params,
+            daily_flow=DEFAULT_DAILY_FLOW,
+            max_iter=80
+        )
+
+        if not opt_result['feasible']:
+            return dbc.Alert([
+                html.H6('🚨 当前冲击负荷过大，建议启动应急旁路', className='alert-heading'),
+                html.Hr(),
+                html.P('优化器无法在当前可调参数范围内找到满足国标一级A达标约束的工艺参数组合。', className='mb-2'),
+                html.P('建议应急措施：', className='fw-bold mb-1'),
+                html.Ul([
+                    html.Li('启动应急旁路，将部分冲击进水超越二级处理直接排放至应急池'),
+                    html.Li('联系上游工业企业排查异常排放源'),
+                    html.Li('增加碳源应急投加罐储量至最大容量'),
+                    html.Li('启动全部备用曝气机组'),
+                ], style={'fontSize': '13px'}),
+            ], color='danger')
+
+        opt_p = opt_result['opt_params']
+        cur_p = opt_result['current_params']
+        adj = opt_result['adjustments']
+
+        cards = dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6('💨 曝气量', className='text-center text-muted'),
+                        html.H4(f'{opt_p["曝气量(m³/h)"]:.1f}', className='text-center text-primary fw-bold'),
+                        html.P(f'当前 {cur_p["曝气量(m³/h)"]:.1f} → 调整 {adj["曝气量"]:+.1f}',
+                               className='text-center text-muted mb-0', style={'fontSize': '12px'})
+                    ])
+                ], className='text-center')
+            ], width=4),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6('🔄 污泥回流比', className='text-center text-muted'),
+                        html.H4(f'{opt_p["污泥回流比(%)"]:.1f}%', className='text-center text-primary fw-bold'),
+                        html.P(f'当前 {cur_p["污泥回流比(%)"]:.1f}% → 调整 {adj["污泥回流比"]:+.1f}%',
+                               className='text-center text-muted mb-0', style={'fontSize': '12px'})
+                    ])
+                ], className='text-center')
+            ], width=4),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6('🧪 碳源投加量', className='text-center text-muted'),
+                        html.H4(f'{opt_p["碳源投加量(L/h)"]:.1f}', className='text-center text-primary fw-bold'),
+                        html.P(f'当前 {cur_p["碳源投加量(L/h)"]:.1f} → 调整 {adj["碳源投加量"]:+.1f}',
+                               className='text-center text-muted mb-0', style={'fontSize': '12px'})
+                    ])
+                ], className='text-center')
+            ], width=4),
+        ], className='mb-3')
+
+        energy_card = dbc.Card([
+            dbc.CardBody([
+                html.H6('⚡ 预估能耗', className='mb-2'),
+                html.P(f'吨水综合能耗: {opt_result["opt_energy_per_ton"]:.4f} kWh/m³', className='mb-1',
+                       style={'fontSize': '13px'}),
+                html.P(f'日运行成本估算: ¥{opt_result["daily_cost_saving"]:.2f}',
+                       className='mb-1', style={'fontSize': '13px'}),
+            ])
+        ], className='mb-3')
+
+        pred_rows = []
+        for i, name in enumerate(KEY_PREDICTORS):
+            cur_mean = opt_result['current_predictions'][:, i].mean()
+            opt_mean = opt_result['opt_predictions'][:, i].mean()
+            std = STANDARDS[name]
+            cur_color = '#d62728' if cur_mean > std else '#27ae60'
+            opt_color = '#27ae60' if opt_mean <= std else '#d62728'
+            pred_rows.append(html.Tr([
+                html.Td(DISPLAY_NAMES.get(name)),
+                html.Td(f'{std}'),
+                html.Td(f'{cur_mean:.3f}', style={'color': cur_color, 'fontWeight': 'bold'}),
+                html.Td(f'{opt_mean:.3f}', style={'color': opt_color, 'fontWeight': 'bold'}),
+            ]))
+
+        pred_table = dbc.Table([
+            html.Thead(html.Tr([
+                html.Th('指标'), html.Th('国标限值'),
+                html.Th('当前预测'), html.Th('优化后预测')
+            ])),
+            html.Tbody(pred_rows)
+        ], bordered=True, hover=True, striped=True, size='sm')
+
+        return dbc.Alert([
+            html.H6('✅ 应急调控方案已生成', className='alert-heading'),
+            html.P(f'冲击高峰时刻: {sim_data["peak_time"]} | 冲击倍率: {sim_data["multiplier"]}×',
+                   className='text-muted mb-3', style={'fontSize': '12px'}),
+            cards, energy_card,
+            html.H6('📊 出水预测达标对比', className='mt-3 mb-2'),
+            pred_table,
+        ], color='success')
+
+    except Exception as e:
+        import traceback
+        return html.Div(f'❌ 优化计算出错: {str(e)}', className='text-danger')
 
 
 if __name__ == '__main__':
