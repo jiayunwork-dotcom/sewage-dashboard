@@ -1,0 +1,80 @@
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Node.js
+node_modules/
+dist/
+build/
+.next/
+.nuxt/
+.output/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+.eggs/
+*.egg
+
+# Go
+/bin/
+/vendor/
+
+# Rust
+/target/
+Cargo.lock
+
+# Java
+*.class
+*.jar
+*.war
+target/
+.gradle/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Docker
+docker-compose.override.yml
+.docker/
+
+# Test coverage
+coverage/
+htmlcov/
+.coverage
+*.lcov
+.nyc_output/
+
+# Misc
+*.bak
+*.tmp
+.cache/
