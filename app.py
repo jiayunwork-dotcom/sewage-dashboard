@@ -162,26 +162,6 @@ def header():
     )
 
 
-TABS_IDS = ['tab-overview', 'tab-prediction', 'tab-warning', 'tab-optimization',
-            'tab-energy', 'tab-sludge', 'tab-seasonal', 'tab-report']
-
-app.layout = html.Div([
-    header(),
-    dcc.Store(id='last-model-store', data=None),
-    dbc.Container([
-        dbc.Tabs([
-            dbc.Tab(label='📊 数据概览', tab_id='tab-overview'),
-            dbc.Tab(label='🔮 出水预测', tab_id='tab-prediction'),
-            dbc.Tab(label='⚠️ 达标预警', tab_id='tab-warning'),
-            dbc.Tab(label='⚙️ 工艺优化', tab_id='tab-optimization'),
-            dbc.Tab(label='⚡ 能耗分析', tab_id='tab-energy'),
-            dbc.Tab(label='🧪 污泥管理', tab_id='tab-sludge'),
-            dbc.Tab(label='🌡️ 季节对比', tab_id='tab-seasonal'),
-            dbc.Tab(label='📄 报告导出', tab_id='tab-report'),
-        ], id='main-tabs', active_tab='tab-overview', className='mb-4'),
-        html.Div(id='tab-content'),
-    ], fluid=True)
-])
 
 
 OVERVIEW_LAYOUT = html.Div([
@@ -538,24 +518,25 @@ REPORT_LAYOUT = html.Div([
 ])
 
 
-LAYOUT_MAP = {
-    'tab-overview': OVERVIEW_LAYOUT,
-    'tab-prediction': PREDICTION_LAYOUT,
-    'tab-warning': WARNING_LAYOUT,
-    'tab-optimization': OPTIMIZATION_LAYOUT,
-    'tab-energy': ENERGY_LAYOUT,
-    'tab-sludge': SLUDGE_LAYOUT,
-    'tab-seasonal': SEASONAL_LAYOUT,
-    'tab-report': REPORT_LAYOUT,
-}
+TABS_IDS = ['tab-overview', 'tab-prediction', 'tab-warning', 'tab-optimization',
+            'tab-energy', 'tab-sludge', 'tab-seasonal', 'tab-report']
 
-
-@app.callback(
-    Output('tab-content', 'children'),
-    Input('main-tabs', 'active_tab')
-)
-def render_tab(tab_id):
-    return LAYOUT_MAP.get(tab_id, html.Div('请选择标签页'))
+app.layout = html.Div([
+    header(),
+    dcc.Store(id='last-model-store', data=None),
+    dbc.Container([
+        dbc.Tabs([
+            dbc.Tab(OVERVIEW_LAYOUT, label='📊 数据概览', tab_id='tab-overview'),
+            dbc.Tab(PREDICTION_LAYOUT, label='🔮 出水预测', tab_id='tab-prediction'),
+            dbc.Tab(WARNING_LAYOUT, label='⚠️ 达标预警', tab_id='tab-warning'),
+            dbc.Tab(OPTIMIZATION_LAYOUT, label='⚙️ 工艺优化', tab_id='tab-optimization'),
+            dbc.Tab(ENERGY_LAYOUT, label='⚡ 能耗分析', tab_id='tab-energy'),
+            dbc.Tab(SLUDGE_LAYOUT, label='🧪 污泥管理', tab_id='tab-sludge'),
+            dbc.Tab(SEASONAL_LAYOUT, label='🌡️ 季节对比', tab_id='tab-seasonal'),
+            dbc.Tab(REPORT_LAYOUT, label='📄 报告导出', tab_id='tab-report'),
+        ], id='main-tabs', active_tab='tab-overview', className='mb-4', persistence=True),
+    ], fluid=True)
+])
 
 
 @app.callback(
