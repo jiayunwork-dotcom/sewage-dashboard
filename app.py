@@ -19,7 +19,8 @@ from data_processing import (
 )
 from models import (
     train_lstm, train_xgboost, train_fusion, predict_lstm, predict_xgboost,
-    predict_fusion, compute_metrics, estimate_violation_probability
+    predict_fusion, compute_metrics, estimate_violation_probability,
+    compute_shap_feature_importance, get_single_sample_shap, SHAP_AVAILABLE
 )
 from optimization import (
     optimize_process, generate_suggestion_text, compute_energy, compute_daily_cost,
@@ -41,7 +42,10 @@ GLOBAL_STATE = {
     'lstm_result': None, 'xgb_result': None, 'fusion_result': None,
     'fusion_lstm_weight': 0.5,
     'scaler': None, 'feature_cols': None, 'target_cols': None,
-    'last_prediction': None, 'last_prediction_times': None
+    'last_prediction': None, 'last_prediction_times': None,
+    'shap_values': None, 'shap_flat_names': None, 'shap_mean_abs': None,
+    'shap_target': None, 'shap_horizon': None,
+    'raw_df': None, 'missing_mask': None
 }
 
 COLOR_PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
@@ -188,6 +192,29 @@ OVERVIEW_LAYOUT = html.Div([
     ], className='mb-4'),
 
     dbc.Card([
+        dbc.CardHeader('📊 数据质量评估', className='bg-warning text-dark'),
+        dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.H6('📋 数据完整度', className='text-center mb-2'),
+                    html.Div(id='dq-completeness', className='text-center fs-3 fw-bold text-primary'),
+                    html.Div(id='dq-total-records', className='text-center text-muted fs-7')
+                ], width=2),
+                dbc.Col([
+                    html.H6(f'⚠️ 缺失值评估', className='mb-2'),
+                    html.Div(id='dq-missing-total', className='fs-6 mb-2'),
+                    html.Div(id='dq-missing-list', style={'maxHeight': '180px', 'overflowY': 'auto'})
+                ], width=5),
+                dbc.Col([
+                    html.H6(f'🔴 异常值评估', className='mb-2'),
+                    html.Div(id='dq-outlier-total', className='fs-6 mb-2'),
+                    html.Div(id='dq-outlier-list', style={'maxHeight': '180px', 'overflowY': 'auto'})
+                ], width=5),
+            ])
+        ])
+    ], className='mb-4'),
+
+    dbc.Card([
         dbc.CardHeader('统计摘要', className='bg-light'),
         dbc.CardBody([
             dash_table.DataTable(
@@ -262,6 +289,35 @@ PREDICTION_LAYOUT = html.Div([
                     dcc.Loading(id='train-loading', type='circle',
                                 children=html.Div(id='train-status', className='mt-3'))
                 ])
+            ], className='mb-3'),
+            dbc.Card([
+                dbc.CardHeader('SHAP 模型解释设置', className='bg-secondary text-white'),
+                dbc.CardBody([
+                    dbc.Label('解释目标指标'),
+                    dcc.Dropdown(
+                        id='shap-target-select',
+                        options=[{'label': DISPLAY_NAMES.get(c, c), 'value': c} for c in KEY_PREDICTORS],
+                        value=KEY_PREDICTORS[0], clearable=False, className='mb-3'
+                    ),
+                    dbc.Label('解释预测时刻'),
+                    dcc.Dropdown(
+                        id='shap-horizon-select',
+                        options=[{'label': f'未来第 {i+1} 小时', 'value': i} for i in range(4)],
+                        value=0, clearable=False, className='mb-3'
+                    ),
+                    dbc.Button('🔬 计算 SHAP 特征重要性', id='compute-shap-btn',
+                               color='info', className='w-100'),
+                    dcc.Loading(id='shap-loading', type='circle',
+                                children=html.Div(id='shap-status', className='mt-2', style={'fontSize': '12px'})),
+                    html.Hr(),
+                    dbc.Label('单样本解释 - 选择测试集时刻'),
+                    dcc.Dropdown(
+                        id='shap-sample-select',
+                        options=[], placeholder='先计算 SHAP 后选择样本时刻',
+                        className='mb-2'
+                    ),
+                    html.Div(id='shap-sample-info', className='text-muted fs-7')
+                ])
             ])
         ], width=4),
         dbc.Col([
@@ -287,6 +343,18 @@ PREDICTION_LAYOUT = html.Div([
                         style_header={'backgroundColor': '#d5f5e3', 'fontWeight': 'bold'},
                         style_cell={'textAlign': 'center', 'padding': '8px', 'fontSize': '12px'}
                     )
+                ])
+            ], className='mb-3'),
+            dbc.Card([
+                dbc.CardHeader('🔬 SHAP 特征重要性 (Top 10 平均绝对贡献)', className='bg-light'),
+                dbc.CardBody([
+                    dcc.Graph(id='shap-bar-chart', style={'height': '420px'})
+                ])
+            ], className='mb-3'),
+            dbc.Card([
+                dbc.CardHeader('💧 单样本 SHAP 解释瀑布图', className='bg-light'),
+                dbc.CardBody([
+                    dcc.Graph(id='shap-waterfall-chart', style={'height': '480px'})
                 ])
             ])
         ], width=8),
@@ -547,6 +615,12 @@ app.layout = html.Div([
     Output('ts-metrics', 'value'),
     Output('warning-start-time', 'options'),
     Output('report-date-select', 'options'),
+    Output('dq-completeness', 'children'),
+    Output('dq-total-records', 'children'),
+    Output('dq-missing-total', 'children'),
+    Output('dq-missing-list', 'children'),
+    Output('dq-outlier-total', 'children'),
+    Output('dq-outlier-list', 'children'),
     Input('upload-data', 'contents'),
     State('upload-data', 'filename'),
     State('upload-data', 'last_modified'),
@@ -559,24 +633,30 @@ def handle_upload(contents, filename, last_modified, sample_n):
 
     try:
         if triggered == 'use-sample-btn' or (triggered == 'upload-data' and contents is None):
-            df = generate_sample_data()
+            df_raw = generate_sample_data()
             time_col = '时间'
-            outlier_mask = pd.DataFrame(False, index=df.index, columns=df.select_dtypes(include=[np.number]).columns)
-            status = f'✅ 已加载模拟示例数据，共 {len(df)} 条记录（90天小时级）'
+            status = f'✅ 已加载模拟示例数据，共 {len(df_raw)} 条记录（90天小时级）'
         else:
             content_type, content_string = contents.split(',')
             decoded = base64.b64decode(content_string)
             tmp_path = f'temp_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
             with open(tmp_path, 'wb') as f:
                 f.write(decoded)
-            df, outlier_mask = load_and_clean_csv(tmp_path)
-            time_col = df.columns[0]
+            df_raw = pd.read_csv(tmp_path, encoding='utf-8-sig')
+            time_col = df_raw.columns[0]
             try:
                 os.remove(tmp_path)
             except:
                 pass
-            status = f'✅ 文件 "{filename}" 上传成功，共 {len(df)} 条记录'
+            status = f'✅ 文件 "{filename}" 上传成功，共 {len(df_raw)} 条记录'
 
+        GLOBAL_STATE['raw_df'] = df_raw.copy()
+        df, outlier_mask = load_and_clean_csv(df_raw=df_raw)
+        time_col = df.columns[0]
+
+        numeric_cols_raw = df_raw.select_dtypes(include=[np.number]).columns.tolist()
+        missing_mask = df_raw[numeric_cols_raw].isna()
+        GLOBAL_STATE['missing_mask'] = missing_mask
         GLOBAL_STATE['df'] = df
         GLOBAL_STATE['outlier_mask'] = outlier_mask
         GLOBAL_STATE['time_col'] = time_col
@@ -594,12 +674,100 @@ def handle_upload(contents, filename, last_modified, sample_n):
         dates = sorted(set(t.strftime('%Y-%m-%d') for t in pd.to_datetime(df[time_col])))
         date_opts = [{'label': d, 'value': d} for d in dates]
 
-        return status, stats_cols, stats_data, ts_options, ts_default, warn_opts, date_opts
+        n_records = len(df_raw)
+        total_cells = n_records * len(numeric_cols_raw)
+        total_missing = int(missing_mask.sum().sum())
+        total_outliers = int(outlier_mask[numeric_cols_raw].sum().sum()) if outlier_mask is not None else 0
+
+        def _row_mask_has_issue(col_list):
+            mask = pd.Series(False, index=df_raw.index)
+            for c in col_list:
+                if c in missing_mask.columns:
+                    mask = mask | missing_mask[c]
+                if outlier_mask is not None and c in outlier_mask.columns:
+                    mask = mask | outlier_mask[c]
+            return mask
+
+        bad_mask = pd.Series(False, index=df_raw.index)
+        for c in numeric_cols_raw:
+            if c in missing_mask.columns:
+                bad_mask = bad_mask | missing_mask[c]
+            if outlier_mask is not None and c in outlier_mask.columns:
+                bad_mask = bad_mask | outlier_mask[c]
+        completeness = 100.0 * (1 - bad_mask.mean())
+
+        def _progress_bar(pct, label):
+            color = '#e74c3c' if pct > 10 else '#27ae60'
+            bar_color = '#e74c3c' if pct > 10 else '#3498db'
+            return html.Div([
+                html.Div([
+                    html.Span(label, style={'fontSize': '12px'}),
+                    html.Span(f'{pct:.2f}%',
+                              style={'fontSize': '12px', 'color': color, 'fontWeight': 'bold',
+                                     'float': 'right'})
+                ]),
+                html.Div([
+                    html.Div(style={'width': f'{min(pct, 100)}%', 'height': '8px',
+                                    'backgroundColor': bar_color, 'borderRadius': '4px'})
+                ], style={'width': '100%', 'height': '8px', 'backgroundColor': '#ecf0f1',
+                          'borderRadius': '4px', 'marginTop': '2px'})
+            ], style={'marginBottom': '6px'})
+
+        missing_ratios = (missing_mask.mean() * 100).sort_values(ascending=False)
+        missing_top5 = missing_ratios[missing_ratios > 0].head(5)
+        if len(missing_top5) > 0:
+            missing_list = html.Div([
+                _progress_bar(float(v), DISPLAY_NAMES.get(c, c))
+                for c, v in missing_top5.items()
+            ])
+        else:
+            missing_list = html.Div('✅ 无缺失值', className='text-success fs-7')
+
+        outlier_ratios = (outlier_mask[numeric_cols_raw].mean() * 100).sort_values(ascending=False) if outlier_mask is not None else pd.Series(dtype=float)
+        outlier_top5 = outlier_ratios[outlier_ratios > 0].head(5)
+        if len(outlier_top5) > 0:
+            outlier_list = html.Div([
+                _progress_bar(float(v), DISPLAY_NAMES.get(c, c))
+                for c, v in outlier_top5.items()
+            ])
+        else:
+            outlier_list = html.Div('✅ 无异常值(3σ)', className='text-success fs-7')
+
+        completeness_color = '#27ae60' if completeness >= 95 else ('#f39c12' if completeness >= 80 else '#e74c3c')
+
+        return (
+            status, stats_cols, stats_data, ts_options, ts_default, warn_opts, date_opts,
+            html.Span(f'{completeness:.1f}%', style={'color': completeness_color}),
+            html.Div([
+                html.Div(f'总记录: {n_records} 行'),
+                html.Div(f'有效记录: {int((~bad_mask).sum())} 行')
+            ], style={'fontSize': '11px', 'lineHeight': '1.4'}),
+            html.Div([
+                html.Span(f'缺失总数: ', className='text-muted'),
+                html.Span(f'{total_missing}', className='fw-bold',
+                          style={'color': '#e74c3c' if total_missing > 0 else '#27ae60'}),
+                html.Span(f' 个 / {total_cells} 个', className='text-muted')
+            ]),
+            missing_list,
+            html.Div([
+                html.Span(f'异常总数: ', className='text-muted'),
+                html.Span(f'{total_outliers}', className='fw-bold',
+                          style={'color': '#e74c3c' if total_outliers > 0 else '#27ae60'}),
+                html.Span(f' 个 / {total_cells} 个', className='text-muted')
+            ]),
+            outlier_list
+        )
 
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        return f'❌ 错误: {str(e)}', [], [], [], [], [], []
+        print(f'[handle_upload ERROR] {str(e)}')
+        print(tb)
+        return (
+            html.Div(f'❌ 错误: {str(e)}', className='text-danger'),
+            [], [], [], [], [], [],
+            '-', '-', '-', html.Div(), '-', html.Div()
+        )
 
 
 @app.callback(
@@ -855,6 +1023,211 @@ def _get_predict_fn(model_type):
     else:
         w = GLOBAL_STATE.get('fusion_lstm_weight', 0.5)
         return lambda X: predict_fusion(GLOBAL_STATE['lstm_model'], GLOBAL_STATE['xgb_model'], X, w)
+
+
+@app.callback(
+    Output('shap-status', 'children'),
+    Output('shap-sample-select', 'options'),
+    Output('shap-bar-chart', 'figure'),
+    Input('compute-shap-btn', 'n_clicks'),
+    State('shap-target-select', 'value'),
+    State('shap-horizon-select', 'value'),
+    prevent_initial_call=True
+)
+def compute_shap(n_clicks, target, horizon):
+    if not SHAP_AVAILABLE:
+        return html.Div('⚠️ shap 库未安装，请先运行 pip install shap', className='text-warning'), [], go.Figure()
+
+    if GLOBAL_STATE.get('last_model_type') is None:
+        return html.Div('⚠️ 请先训练模型', className='text-warning'), [], go.Figure()
+
+    if GLOBAL_STATE.get('X_train') is None:
+        return html.Div('⚠️ 缺少训练数据', className='text-warning'), [], go.Figure()
+
+    try:
+        model_type = GLOBAL_STATE['last_model_type']
+        target_idx = KEY_PREDICTORS.index(target)
+        feature_cols = [c for c in INFLOW_INDICATORS + PROCESS_PARAMS if c in GLOBAL_STATE['df'].columns]
+
+        result = compute_shap_feature_importance(
+            model_type=model_type,
+            lstm_model=GLOBAL_STATE.get('lstm_model'),
+            xgb_model=GLOBAL_STATE.get('xgb_model'),
+            X_train=GLOBAL_STATE['X_train'],
+            X_test=GLOBAL_STATE['X_test'],
+            feature_cols=feature_cols,
+            target_idx=target_idx,
+            horizon=horizon,
+            lstm_weight=GLOBAL_STATE.get('fusion_lstm_weight', 0.5),
+            n_background=30
+        )
+
+        if result is None:
+            return html.Div('❌ SHAP 计算失败', className='text-danger'), [], go.Figure()
+
+        shap_values, flat_names, mean_abs_shap = result
+        GLOBAL_STATE['shap_values'] = shap_values
+        GLOBAL_STATE['shap_flat_names'] = flat_names
+        GLOBAL_STATE['shap_mean_abs'] = mean_abs_shap
+        GLOBAL_STATE['shap_target'] = target
+        GLOBAL_STATE['shap_horizon'] = horizon
+
+        feature_agg = {}
+        for i, name in enumerate(flat_names):
+            for col in feature_cols:
+                if name.startswith(col + '_'):
+                    if col not in feature_agg:
+                        feature_agg[col] = 0.0
+                    feature_agg[col] += mean_abs_shap[i]
+                    break
+
+        sorted_feats = sorted(feature_agg.items(), key=lambda x: x[1], reverse=True)
+        top_feats = sorted_feats[:10]
+        top_names = [DISPLAY_NAMES.get(k, k) for k, v in top_feats]
+        top_vals = [v for k, v in top_feats]
+
+        bar_colors = ['#e74c3c' if i < 3 else ('#f39c12' if i < 6 else '#3498db')
+                      for i in range(len(top_feats))]
+
+        fig_bar = go.Figure(go.Bar(
+            x=top_vals[::-1],
+            y=top_names[::-1],
+            orientation='h',
+            marker=dict(color=bar_colors[::-1], line=dict(color='white', width=1)),
+            text=[f'{v:.4f}' for v in top_vals[::-1]],
+            textposition='outside',
+        ))
+        fig_bar.update_layout(
+            title=f'Top 10 特征对 {DISPLAY_NAMES.get(target)} (t+{horizon+1}h) 的平均绝对SHAP贡献',
+            template='plotly_white',
+            xaxis_title='Mean |SHAP value|',
+            margin=dict(l=150, r=40, t=60, b=40),
+            height=420
+        )
+
+        time_col = GLOBAL_STATE['time_col']
+        df_times = pd.to_datetime(GLOBAL_STATE['df'][time_col]).values
+        lookback = 24
+        start_test = len(GLOBAL_STATE['X_train']) + lookback
+        sample_opts = []
+        n_test = len(GLOBAL_STATE['X_test'])
+        step = max(1, n_test // 100)
+        for i in range(0, n_test, step):
+            t_idx = start_test + i
+            if t_idx < len(df_times):
+                t_str = str(df_times[t_idx])[:16]
+                sample_opts.append({'label': t_str, 'value': i})
+
+        status = html.Div([
+            html.P('✅ SHAP 计算完成', className='text-success fw-bold', style={'margin': '2px 0'}),
+            html.P(f'样本数: {shap_values.shape[0]}, 展平特征数: {shap_values.shape[1]}',
+                   className='text-muted fs-7', style={'margin': '2px 0'})
+        ])
+
+        return status, sample_opts, fig_bar
+
+    except Exception as e:
+        import traceback
+        return html.Div(f'❌ SHAP 计算出错: {str(e)}', className='text-danger'), [], go.Figure()
+
+
+@app.callback(
+    Output('shap-waterfall-chart', 'figure'),
+    Output('shap-sample-info', 'children'),
+    Input('shap-sample-select', 'value'),
+    State('shap-target-select', 'value'),
+    State('shap-horizon-select', 'value'),
+    prevent_initial_call=True
+)
+def update_waterfall(sample_idx, target, horizon):
+    if GLOBAL_STATE.get('shap_values') is None or sample_idx is None:
+        raise dash.exceptions.PreventUpdate
+
+    try:
+        feature_cols = [c for c in INFLOW_INDICATORS + PROCESS_PARAMS if c in GLOBAL_STATE['df'].columns]
+        lookback = 24
+
+        sample_info = get_single_sample_shap(
+            GLOBAL_STATE['shap_values'],
+            GLOBAL_STATE['shap_flat_names'],
+            sample_idx,
+            feature_cols,
+            lookback
+        )
+
+        feats = sample_info['features']
+        vals = sample_info['shap_values']
+
+        model_type = GLOBAL_STATE['last_model_type']
+        if model_type == 'lstm':
+            test_pred = GLOBAL_STATE['lstm_result']['test_pred']
+        elif model_type == 'xgb':
+            test_pred = GLOBAL_STATE['xgb_result']['test_pred']
+        else:
+            test_pred = GLOBAL_STATE['fusion_result']['test_pred']
+        target_idx = KEY_PREDICTORS.index(target)
+        pred_value = float(test_pred[sample_idx, horizon, target_idx])
+
+        base_value = pred_value - sum(vals)
+
+        display_top_n = min(len(feats), 12)
+        feats_show = feats[:display_top_n]
+        vals_show = vals[:display_top_n]
+        if len(feats) > display_top_n:
+            remaining_sum = sum(vals[display_top_n:])
+            feats_show.append(f'其他 {len(feats) - display_top_n} 项')
+            vals_show.append(remaining_sum)
+
+        measure = ['relative'] * len(vals_show) + ['total']
+        x_labels = [DISPLAY_NAMES.get(f, f) for f in feats_show] + ['最终预测值']
+
+        y_start = base_value
+        y_values = vals_show + [pred_value]
+
+        colors = ['#e74c3c' if v < 0 else '#27ae60' for v in vals_show] + ['#3498db']
+
+        fig = go.Figure(go.Waterfall(
+            name='SHAP',
+            orientation='v',
+            measure=measure,
+            x=x_labels,
+            textposition='outside',
+            text=[f'{v:+.4f}' for v in vals_show] + [f'{pred_value:.4f}'],
+            y=y_values,
+            base=base_value,
+            decreasing=dict(marker=dict(color='#e74c3c')),
+            increasing=dict(marker=dict(color='#27ae60')),
+            totals=dict(marker=dict(color='#3498db')),
+            connector=dict(line=dict(color='#95a5a6', dash='dot'))
+        ))
+
+        fig.update_layout(
+            title=f'SHAP 瀑布图: {DISPLAY_NAMES.get(target)} (t+{horizon+1}h) 样本 #{sample_idx}<br>'
+                  f'<sup>基线值 E[f(x)] = {base_value:.4f} | 预测值 f(x) = {pred_value:.4f}</sup>',
+            template='plotly_white',
+            yaxis_title=f'{DISPLAY_NAMES.get(target)}',
+            xaxis_tickangle=-45,
+            margin=dict(l=60, r=20, t=90, b=100),
+            height=480
+        )
+
+        time_col = GLOBAL_STATE['time_col']
+        df_times = pd.to_datetime(GLOBAL_STATE['df'][time_col]).values
+        start_test = len(GLOBAL_STATE['X_train']) + lookback
+        t_idx = start_test + sample_idx
+        t_str = str(df_times[t_idx])[:16] if t_idx < len(df_times) else 'N/A'
+
+        info = html.Div([
+            html.P(f'📅 时刻: {t_str}', style={'margin': '2px 0', 'fontSize': '12px'}),
+            html.P(f'🎯 预测值: {pred_value:.4f} mg/L', style={'margin': '2px 0', 'fontSize': '12px'}),
+            html.P(f'📍 基线值: {base_value:.4f} mg/L', style={'margin': '2px 0', 'fontSize': '12px'})
+        ])
+
+        return fig, info
+
+    except Exception as e:
+        import traceback
+        return go.Figure(), html.Div(f'出错: {str(e)}', className='text-danger')
 
 
 @app.callback(

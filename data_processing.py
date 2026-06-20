@@ -44,8 +44,11 @@ def detect_time_column(df: pd.DataFrame) -> str:
         raise ValueError('未找到时间列，请确保CSV包含时间/日期列')
 
 
-def load_and_clean_csv(file_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df = pd.read_csv(file_path, encoding='utf-8-sig')
+def load_and_clean_csv(file_path: str = None, df_raw: pd.DataFrame = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if df_raw is None:
+        df = pd.read_csv(file_path, encoding='utf-8-sig')
+    else:
+        df = df_raw.copy()
     time_col = detect_time_column(df)
     df[time_col] = pd.to_datetime(df[time_col])
     df = df.sort_values(time_col).reset_index(drop=True)

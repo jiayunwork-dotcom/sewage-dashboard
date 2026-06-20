@@ -10,6 +10,13 @@ warnings.filterwarnings('ignore')
 
 from data_processing import KEY_PREDICTORS
 
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+    shap = None
+
 
 class LSTMPredictor(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int = 64, num_layers: int = 2,
@@ -186,3 +193,108 @@ def estimate_violation_probability(model_type: str, y_test: np.ndarray, y_pred: 
             violations.append(min(max(prob, 0.0), 1.0))
         probs[name] = violations
     return probs
+
+
+def _build_flat_feature_names(feature_cols: List[str], lookback: int) -> List[str]:
+    names = []
+    for t in range(lookback):
+        for col in feature_cols:
+            names.append(f'{col}_t-{lookback - t}')
+    return names
+
+
+def compute_shap_feature_importance(
+    model_type: str,
+    lstm_model: Optional[nn.Module],
+    xgb_model: Optional[object],
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    feature_cols: List[str],
+    target_idx: int = 0,
+    horizon: int = 0,
+    lstm_weight: float = 0.5,
+    n_background: int = 50
+) -> Optional[Tuple[np.ndarray, List[str], np.ndarray]]:
+    if not SHAP_AVAILABLE:
+        return None
+
+    try:
+        lookback = X_train.shape[1]
+        n_features = X_train.shape[2]
+        flat_names = _build_flat_feature_names(feature_cols, lookback)
+
+        X_train_flat = X_train.reshape(X_train.shape[0], -1)
+        X_test_flat = X_test.reshape(X_test.shape[0], -1)
+
+        if X_train_flat.shape[0] > n_background:
+            bg_idx = np.random.choice(X_train_flat.shape[0], n_background, replace=False)
+            background = X_train_flat[bg_idx]
+        else:
+            background = X_train_flat
+
+        def _lstm_predict_flat(X_flat: np.ndarray) -> np.ndarray:
+            X_3d = X_flat.reshape(X_flat.shape[0], lookback, n_features)
+            pred = predict_lstm(lstm_model, X_3d.astype(np.float32))
+            return pred[:, horizon, target_idx]
+
+        def _xgb_predict_flat(X_flat: np.ndarray) -> np.ndarray:
+            pred = predict_xgboost(xgb_model, X_flat.reshape(X_flat.shape[0], lookback, n_features).astype(np.float32))
+            return pred[:, horizon, target_idx]
+
+        def _fusion_predict_flat(X_flat: np.ndarray) -> np.ndarray:
+            lstm_pred = _lstm_predict_flat(X_flat)
+            xgb_pred = _xgb_predict_flat(X_flat)
+            return lstm_weight * lstm_pred + (1 - lstm_weight) * xgb_pred
+
+        if model_type == 'lstm':
+            predict_fn = _lstm_predict_flat
+        elif model_type == 'xgb':
+            predict_fn = _xgb_predict_flat
+        else:
+            predict_fn = _fusion_predict_flat
+
+        explainer = shap.KernelExplainer(predict_fn, background)
+        shap_values = explainer.shap_values(X_test_flat, nsamples=100, silent=True)
+
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+
+        mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+
+        return shap_values, flat_names, mean_abs_shap
+
+    except Exception as e:
+        import traceback
+        print(f'SHAP computation error: {e}')
+        print(traceback.format_exc())
+        return None
+
+
+def get_single_sample_shap(
+    shap_values: np.ndarray,
+    flat_names: List[str],
+    sample_idx: int,
+    feature_cols: List[str],
+    lookback: int
+) -> Dict:
+    sample_shap = shap_values[sample_idx]
+
+    feature_agg = {}
+    for i, name in enumerate(flat_names):
+        for col in feature_cols:
+            if name.startswith(col + '_'):
+                if col not in feature_agg:
+                    feature_agg[col] = 0.0
+                feature_agg[col] += sample_shap[i]
+                break
+
+    sorted_items = sorted(feature_agg.items(), key=lambda x: abs(x[1]), reverse=True)
+    sorted_features = [k for k, v in sorted_items]
+    sorted_values = [v for k, v in sorted_items]
+
+    return {
+        'features': sorted_features,
+        'shap_values': sorted_values,
+        'base_value': float(np.mean(shap_values, axis=0).sum() - np.mean(shap_values)),
+        'total_contribution': float(np.sum(sorted_values))
+    }
