@@ -661,6 +661,58 @@ SHOCK_SIM_LAYOUT = html.Div([
                                color='warning', className='mb-3', disabled=True),
                     html.Div(id='emergency-plan-result')
                 ])
+            ], className='mb-3'),
+            dbc.Card([
+                dbc.CardHeader('📊 多方案对比 — 应急调控方案对比', className='bg-info text-white'),
+                dbc.CardBody([
+                    html.Div([
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button('➕ 增加方案', id='add-plan-btn', color='primary', size='sm', className='me-2')
+                            ], width='auto'),
+                            dbc.Col([
+                                dbc.Button('➖ 移除最后一组', id='remove-plan-btn', color='secondary', size='sm', className='me-2')
+                            ], width='auto'),
+                            dbc.Col([
+                                dbc.Button('🚀 执行多方案对比', id='run-compare-btn', color='info', size='sm')
+                            ], width='auto'),
+                            dbc.Col([
+                                html.Span('（最多5组方案）', className='text-muted', style={'fontSize': '12px'})
+                            ], width='auto'),
+                        ], className='mb-3 align-items-center'),
+                        html.Div(id='plans-accordion-container', className='mb-3'),
+                        dcc.Loading(id='compare-loading', type='circle',
+                                    children=html.Div(id='compare-status', className='mt-2 mb-3')),
+                        dcc.Graph(id='compare-chart', style={'height': '450px'}, className='mb-3'),
+                        html.H6('📋 方案对比分析表（按超标幅度升序）', className='mb-2'),
+                        dash_table.DataTable(
+                            id='compare-table',
+                            columns=[
+                                {'name': '排名', 'id': 'rank'},
+                                {'name': '方案名称', 'id': 'plan_name'},
+                                {'name': '曝气量(m³/h)', 'id': 'aeration'},
+                                {'name': '回流比(%)', 'id': 'return_ratio'},
+                                {'name': '碳源投加量(L/h)', 'id': 'carbon'},
+                                {'name': '最大超标幅度(%)', 'id': 'max_exceed_pct'},
+                                {'name': '超标时长(小时)', 'id': 'exceed_hours'},
+                                {'name': '预估总能耗(kWh)', 'id': 'total_energy'},
+                            ],
+                            data=[],
+                            style_table={'overflowX': 'auto'},
+                            style_header={'backgroundColor': '#d6eaf8', 'fontWeight': 'bold'},
+                            style_cell={'textAlign': 'center', 'padding': '8px', 'fontSize': '12px'},
+                            style_data_conditional=[
+                                {
+                                    'if': {'filter_query': '{rank} = 1'},
+                                    'backgroundColor': '#d5f5e3',
+                                    'fontWeight': 'bold'
+                                }
+                            ],
+                            sort_action='native',
+                            page_size=10
+                        )
+                    ], id='multi-plan-section', style={'display': 'none'})
+                ])
             ])
         ], width=9),
     ], className='mb-4')
@@ -674,6 +726,7 @@ app.layout = html.Div([
     header(),
     dcc.Store(id='last-model-store', data=None),
     dcc.Store(id='shock-sim-store', data=None),
+    dcc.Store(id='plan-count-store', data=1),
     dbc.Container([
         dbc.Tabs([
             dbc.Tab(OVERVIEW_LAYOUT, label='📊 数据概览', tab_id='tab-overview'),
@@ -1114,6 +1167,78 @@ def _get_predict_fn(model_type):
     else:
         w = GLOBAL_STATE.get('fusion_lstm_weight', 0.5)
         return lambda X: predict_fusion(GLOBAL_STATE['lstm_model'], GLOBAL_STATE['xgb_model'], X, w)
+
+
+def _run_shock_prediction_with_params(df, time_col, start_idx, duration, multiplier,
+                                      lookback=24, recovery_hours=4,
+                                      override_params=None):
+    """
+    执行冲击负荷滚动预测。
+    override_params: dict, 可选，键为'曝气量'/'污泥回流比'/'碳源投加量'，值为设定的数值。
+                    若提供，则在冲击时段和恢复期内使用指定值替换原工艺参数。
+    返回 (pred_arr, actual_times, baseline_info)
+    """
+    feature_cols = [c for c in INFLOW_INDICATORS + PROCESS_PARAMS if c in df.columns]
+    col_idx = {name: feature_cols.index(name) for name in feature_cols}
+
+    baseline_window = df.iloc[start_idx - 24:start_idx]
+    baseline_cod = baseline_window['COD_in'].mean()
+    baseline_tn = baseline_window['TN_in'].mean()
+    baseline_tp = baseline_window['TP_in'].mean()
+
+    total_hours = duration + recovery_hours
+    end_idx = start_idx + total_hours
+    times = pd.to_datetime(df.iloc[start_idx:end_idx][time_col]).tolist()
+
+    model_type = GLOBAL_STATE.get('last_model_type', 'lstm')
+    predict_fn = _get_predict_fn(model_type)
+
+    cod_in_col_idx = col_idx['COD_in']
+    tn_in_col_idx = col_idx['TN_in']
+    tp_in_col_idx = col_idx['TP_in']
+    shock_start_data_idx = start_idx
+    shock_end_data_idx = start_idx + duration
+
+    aeration_idx = col_idx.get('曝气量')
+    return_idx = col_idx.get('污泥回流比')
+    carbon_idx = col_idx.get('碳源投加量')
+
+    predictions_all = []
+    for step in range(total_hours):
+        window_start = start_idx + step - lookback
+        window_end = start_idx + step
+        if window_start < 0 or window_end > len(df):
+            break
+
+        state_window = df.iloc[window_start:window_end][feature_cols].values.astype(np.float32).copy()
+
+        for t_in_window in range(lookback):
+            actual_data_idx = window_start + t_in_window
+            if shock_start_data_idx <= actual_data_idx < shock_end_data_idx:
+                state_window[t_in_window, cod_in_col_idx] = baseline_cod * multiplier
+                state_window[t_in_window, tn_in_col_idx] = baseline_tn * multiplier
+                state_window[t_in_window, tp_in_col_idx] = baseline_tp * multiplier
+
+            if override_params is not None:
+                is_shock_or_recovery = shock_start_data_idx <= actual_data_idx < (start_idx + total_hours)
+                if is_shock_or_recovery:
+                    if aeration_idx is not None and '曝气量' in override_params:
+                        state_window[t_in_window, aeration_idx] = float(override_params['曝气量'])
+                    if return_idx is not None and '污泥回流比' in override_params:
+                        state_window[t_in_window, return_idx] = float(override_params['污泥回流比'])
+                    if carbon_idx is not None and '碳源投加量' in override_params:
+                        state_window[t_in_window, carbon_idx] = float(override_params['碳源投加量'])
+
+        X_input = state_window.reshape(1, lookback, -1)
+        pred = predict_fn(X_input)[0]
+        predictions_all.append(pred[0].tolist())
+
+    pred_arr = np.array(predictions_all) if predictions_all else np.empty((0, len(KEY_PREDICTORS)))
+    n_actual = len(pred_arr)
+    actual_times = times[:n_actual]
+    baseline_info = {'baseline_cod': baseline_cod, 'baseline_tn': baseline_tn, 'baseline_tp': baseline_tp,
+                     'total_hours': total_hours}
+    return pred_arr, actual_times, baseline_info
 
 
 @app.callback(
@@ -2004,6 +2129,7 @@ def export_report(n_clicks, date_str, warn_idx):
     Output('shock-violation-table', 'data'),
     Output('shock-sim-store', 'data'),
     Output('gen-emergency-plan-btn', 'disabled'),
+    Output('multi-plan-section', 'style'),
     Input('run-shock-sim-btn', 'n_clicks'),
     State('shock-start-time', 'value'),
     State('shock-duration', 'value'),
@@ -2013,13 +2139,13 @@ def export_report(n_clicks, date_str, warn_idx):
 def run_shock_simulation(n_clicks, start_idx, duration, multiplier):
     if GLOBAL_STATE.get('lstm_model') is None and GLOBAL_STATE.get('xgb_model') is None:
         return html.Div('⚠️ 请先在出水预测页面训练模型', className='text-warning'), \
-               go.Figure(), [], None, True
+               go.Figure(), [], None, True, {'display': 'none'}
     if GLOBAL_STATE['df'] is None:
         return html.Div('⚠️ 请先加载数据', className='text-warning'), \
-               go.Figure(), [], None, True
+               go.Figure(), [], None, True, {'display': 'none'}
     if start_idx is None:
         return html.Div('⚠️ 请选择冲击开始时刻', className='text-warning'), \
-               go.Figure(), [], None, True
+               go.Figure(), [], None, True, {'display': 'none'}
 
     try:
         df = GLOBAL_STATE['df'].copy()
@@ -2033,64 +2159,30 @@ def run_shock_simulation(n_clicks, start_idx, duration, multiplier):
         min_required_after = duration + 4
         if start_idx < min_required_before:
             return html.Div(f'⚠️ 冲击开始时刻前需至少有{min_required_before}小时数据（当前{start_idx}小时）', className='text-warning'), \
-                   go.Figure(), [], None, True
+                   go.Figure(), [], None, True, {'display': 'none'}
         if start_idx + min_required_after > len(df):
             max_allowed_start = len(df) - min_required_after
             return html.Div(f'⚠️ 冲击开始时刻后需至少有{min_required_after}小时数据（冲击时长{duration}h+恢复期4h），请选择更早的时刻', className='text-warning'), \
-                   go.Figure(), [], None, True
+                   go.Figure(), [], None, True, {'display': 'none'}
 
-        model_type = GLOBAL_STATE.get('last_model_type', 'lstm')
-        predict_fn = _get_predict_fn(model_type)
-        feature_cols = [c for c in INFLOW_INDICATORS + PROCESS_PARAMS if c in df.columns]
+        pred_arr, actual_times, baseline_info = _run_shock_prediction_with_params(
+            df, time_col, start_idx, duration, multiplier,
+            lookback=lookback, recovery_hours=4, override_params=None
+        )
+        baseline_cod = baseline_info['baseline_cod']
+        baseline_tn = baseline_info['baseline_tn']
+        baseline_tp = baseline_info['baseline_tp']
+        total_hours = baseline_info['total_hours']
 
-        baseline_window = df.iloc[start_idx - 24:start_idx]
-        baseline_cod = baseline_window['COD_in'].mean()
-        baseline_tn = baseline_window['TN_in'].mean()
-        baseline_tp = baseline_window['TP_in'].mean()
-
-        total_hours = duration + 4
-        end_idx = start_idx + total_hours
-
-        times = pd.to_datetime(df.iloc[start_idx:end_idx][time_col]).tolist()
-
-        predictions_all = []
-        cod_in_col_idx = feature_cols.index('COD_in')
-        tn_in_col_idx = feature_cols.index('TN_in')
-        tp_in_col_idx = feature_cols.index('TP_in')
-        shock_start_data_idx = start_idx
-        shock_end_data_idx = start_idx + duration
-
-        for step in range(total_hours):
-            window_start = start_idx + step - lookback
-            window_end = start_idx + step
-            if window_start < 0 or window_end > len(df):
-                break
-
-            state_window = df.iloc[window_start:window_end][feature_cols].values.astype(np.float32).copy()
-
-            for t_in_window in range(lookback):
-                actual_data_idx = window_start + t_in_window
-                if shock_start_data_idx <= actual_data_idx < shock_end_data_idx:
-                    state_window[t_in_window, cod_in_col_idx] = baseline_cod * multiplier
-                    state_window[t_in_window, tn_in_col_idx] = baseline_tn * multiplier
-                    state_window[t_in_window, tp_in_col_idx] = baseline_tp * multiplier
-
-            X_input = state_window.reshape(1, lookback, -1)
-            pred = predict_fn(X_input)[0]
-            predictions_all.append(pred[0].tolist())
-
-        if not predictions_all:
+        if len(pred_arr) == 0:
             return html.Div('❌ 模拟计算失败，数据范围不足', className='text-danger'), \
-                   go.Figure(), [], None, True
+                   go.Figure(), [], None, True, {'display': 'none'}
 
-        pred_arr = np.array(predictions_all)
         n_actual = len(pred_arr)
-        actual_times = times[:n_actual]
+        standards = {'COD_out': 50, 'TN_out': 15, 'TP_out': 0.5}
+        indicator_colors = {'COD_out': '#1f77b4', 'TN_out': '#ff7f0e', 'TP_out': '#2ca02c'}
 
         fig = go.Figure()
-        indicator_colors = {'COD_out': '#1f77b4', 'TN_out': '#ff7f0e', 'TP_out': '#2ca02c'}
-        standards = {'COD_out': 50, 'TN_out': 15, 'TP_out': 0.5}
-
         for i, name in enumerate(KEY_PREDICTORS):
             vals = pred_arr[:, i]
             color = indicator_colors.get(name, '#333')
@@ -2170,6 +2262,10 @@ def run_shock_simulation(n_clicks, start_idx, duration, multiplier):
             'duration': duration,
             'multiplier': multiplier,
             'start_idx': start_idx,
+            'total_hours': total_hours,
+            'baseline_cod': baseline_cod,
+            'baseline_tn': baseline_tn,
+            'baseline_tp': baseline_tp,
         }
         GLOBAL_STATE['shock_sim_result'] = sim_result
 
@@ -2181,12 +2277,12 @@ def run_shock_simulation(n_clicks, start_idx, duration, multiplier):
                    style={'margin': '2px 0', 'fontSize': '12px'}, className='text-muted'),
         ])
 
-        return status, fig, violation_rows, sim_result, False
+        return status, fig, violation_rows, sim_result, False, {'display': 'block'}
 
     except Exception as e:
         import traceback
         return html.Div(f'❌ 模拟出错: {str(e)}', className='text-danger'), \
-               go.Figure(), [], None, True
+               go.Figure(), [], None, True, {'display': 'none'}
 
 
 @app.callback(
@@ -2322,6 +2418,328 @@ def generate_emergency_plan(n_clicks, sim_data):
     except Exception as e:
         import traceback
         return html.Div(f'❌ 优化计算出错: {str(e)}', className='text-danger')
+
+
+@app.callback(
+    Output('plan-count-store', 'data'),
+    Input('add-plan-btn', 'n_clicks'),
+    Input('remove-plan-btn', 'n_clicks'),
+    State('plan-count-store', 'data'),
+    prevent_initial_call=True
+)
+def manage_plan_count(add_clicks, remove_clicks, current_count):
+    ctx = callback_context
+    triggered = ctx.triggered[0]['prop_id'].split('.')[0]
+    count = int(current_count or 1)
+    if triggered == 'add-plan-btn':
+        count = min(count + 1, 5)
+    elif triggered == 'remove-plan-btn':
+        count = max(count - 1, 1)
+    return count
+
+
+@app.callback(
+    Output('plans-accordion-container', 'children'),
+    Input('plan-count-store', 'data'),
+    prevent_initial_call=False
+)
+def render_plans_accordion(plan_count):
+    plan_count = int(plan_count or 1)
+    items = []
+    default_aeration = [5000, 5500, 4500, 6000, 4000]
+    default_return = [100, 110, 90, 120, 80]
+    default_carbon = [80, 120, 60, 150, 100]
+
+    for i in range(plan_count):
+        plan_id = i + 1
+        name_default = f'方案{plan_id}'
+        aeration_default = default_aeration[i % len(default_aeration)]
+        return_default = default_return[i % len(default_return)]
+        carbon_default = default_carbon[i % len(default_carbon)]
+
+        item = dbc.AccordionItem(
+            [
+                html.Div([
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label('方案名称', className='fw-bold'),
+                            dbc.Input(
+                                id={'type': 'plan-name', 'index': plan_id},
+                                type='text',
+                                value=name_default,
+                                placeholder='自定义方案标签',
+                                className='mb-2'
+                            ),
+                        ], width=12),
+                    ]),
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label('💨 曝气量 (m³/h, 2000~8000)'),
+                            dbc.Input(
+                                id={'type': 'plan-aeration', 'index': plan_id},
+                                type='number',
+                                min=2000, max=8000, step=100,
+                                value=aeration_default,
+                            ),
+                            html.Div(f'默认: {aeration_default}', className='text-muted', style={'fontSize': '11px'}),
+                        ], width=4),
+                        dbc.Col([
+                            dbc.Label('🔄 回流比 (%, 50~150)'),
+                            dbc.Input(
+                                id={'type': 'plan-return', 'index': plan_id},
+                                type='number',
+                                min=50, max=150, step=1,
+                                value=return_default,
+                            ),
+                            html.Div(f'默认: {return_default}', className='text-muted', style={'fontSize': '11px'}),
+                        ], width=4),
+                        dbc.Col([
+                            dbc.Label('🧪 碳源投加量 (L/h, 0~200)'),
+                            dbc.Input(
+                                id={'type': 'plan-carbon', 'index': plan_id},
+                                type='number',
+                                min=0, max=200, step=5,
+                                value=carbon_default,
+                            ),
+                            html.Div(f'默认: {carbon_default}', className='text-muted', style={'fontSize': '11px'}),
+                        ], width=4),
+                    ], className='mt-2'),
+                ])
+            ],
+            title=f'📋 方案{plan_id}',
+            item_id=f'plan-{plan_id}'
+        )
+        items.append(item)
+
+    active_item = ['plan-1'] if plan_count >= 1 else []
+    return dbc.Accordion(items, active_item=active_item, always_open=True, flush=True, id='plans-accordion')
+
+
+def _compute_plan_metrics(pred_arr, total_hours, aeration, return_ratio, carbon):
+    standards = {'COD_out': 50, 'TN_out': 15, 'TP_out': 0.5}
+    max_exceed_pct = 0.0
+    exceed_hours_count = 0
+
+    n_steps = len(pred_arr)
+    for step in range(n_steps):
+        step_has_exceed = False
+        for i, name in enumerate(KEY_PREDICTORS):
+            val = float(pred_arr[step, i])
+            std = standards[name]
+            if val > std:
+                exceed_pct = (val - std) / std * 100
+                if exceed_pct > max_exceed_pct:
+                    max_exceed_pct = exceed_pct
+                step_has_exceed = True
+        if step_has_exceed:
+            exceed_hours_count += 1
+
+    hourly_energy = compute_energy(float(aeration), float(return_ratio), float(carbon))
+    total_energy = hourly_energy * float(total_hours)
+
+    return {
+        'max_exceed_pct': round(max_exceed_pct, 2),
+        'exceed_hours': exceed_hours_count,
+        'total_energy': round(total_energy, 2),
+    }
+
+
+@app.callback(
+    Output('compare-status', 'children'),
+    Output('compare-chart', 'figure'),
+    Output('compare-table', 'data'),
+    Input('run-compare-btn', 'n_clicks'),
+    State('shock-sim-store', 'data'),
+    State('plan-count-store', 'data'),
+    State({'type': 'plan-name', 'index': dash.ALL}, 'value'),
+    State({'type': 'plan-aeration', 'index': dash.ALL}, 'value'),
+    State({'type': 'plan-return', 'index': dash.ALL}, 'value'),
+    State({'type': 'plan-carbon', 'index': dash.ALL}, 'value'),
+    prevent_initial_call=True
+)
+def run_multi_plan_compare(n_clicks, sim_data, plan_count,
+                           plan_names, plan_aerations, plan_returns, plan_carbons):
+    if sim_data is None:
+        return html.Div('⚠️ 请先运行冲击模拟', className='text-warning'), go.Figure(), []
+
+    if GLOBAL_STATE.get('lstm_model') is None and GLOBAL_STATE.get('xgb_model') is None:
+        return html.Div('⚠️ 请先在出水预测页面训练模型', className='text-warning'), go.Figure(), []
+
+    if GLOBAL_STATE['df'] is None:
+        return html.Div('⚠️ 请先加载数据', className='text-warning'), go.Figure(), []
+
+    plan_count = int(plan_count or 1)
+    n_plans_provided = len(plan_names) if plan_names else 0
+    if n_plans_provided < plan_count:
+        plan_count = n_plans_provided
+
+    try:
+        df = GLOBAL_STATE['df'].copy()
+        time_col = GLOBAL_STATE['time_col']
+        start_idx = int(sim_data['start_idx'])
+        duration = int(sim_data['duration'])
+        multiplier = float(sim_data['multiplier'])
+        total_hours = int(sim_data.get('total_hours', duration + 4))
+
+        standards = {'COD_out': 50, 'TN_out': 15, 'TP_out': 0.5}
+        indicator_meta = [
+            ('COD_out', '出水COD', 'circle'),
+            ('TN_out', '出水TN', 'square'),
+            ('TP_out', '出水TP', 'diamond'),
+        ]
+        plan_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+        line_styles = ['solid', 'dash', 'dot', 'dashdot', 'longdash']
+
+        all_results = []
+        actual_times_ref = None
+        duration_ref = duration
+
+        for p_idx in range(plan_count):
+            name = plan_names[p_idx] if p_idx < len(plan_names) else f'方案{p_idx+1}'
+            aeration = float(plan_aerations[p_idx] if p_idx < len(plan_aerations) else 5000)
+            ret_ratio = float(plan_returns[p_idx] if p_idx < len(plan_returns) else 100)
+            carbon = float(plan_carbons[p_idx] if p_idx < len(plan_carbons) else 80)
+
+            aeration = np.clip(aeration, 2000, 8000)
+            ret_ratio = np.clip(ret_ratio, 50, 150)
+            carbon = np.clip(carbon, 0, 200)
+
+            override = {
+                '曝气量': aeration,
+                '污泥回流比': ret_ratio,
+                '碳源投加量': carbon,
+            }
+
+            pred_arr, actual_times, _ = _run_shock_prediction_with_params(
+                df, time_col, start_idx, duration, multiplier,
+                lookback=24, recovery_hours=4, override_params=override
+            )
+
+            if actual_times_ref is None and len(actual_times) > 0:
+                actual_times_ref = actual_times
+
+            metrics = _compute_plan_metrics(pred_arr, total_hours, aeration, ret_ratio, carbon)
+
+            all_results.append({
+                'plan_id': p_idx + 1,
+                'plan_name': name or f'方案{p_idx+1}',
+                'aeration': aeration,
+                'return_ratio': ret_ratio,
+                'carbon': carbon,
+                'pred_arr': pred_arr,
+                'actual_times': actual_times,
+                'max_exceed_pct': metrics['max_exceed_pct'],
+                'exceed_hours': metrics['exceed_hours'],
+                'total_energy': metrics['total_energy'],
+            })
+
+        if actual_times_ref is None:
+            return html.Div('❌ 多方案对比计算失败，无有效预测结果', className='text-danger'), go.Figure(), []
+
+        all_results.sort(key=lambda r: r['max_exceed_pct'])
+
+        fig = go.Figure()
+        for r_idx, result in enumerate(all_results):
+            color = plan_colors[r_idx % len(plan_colors)]
+            dash_style = line_styles[r_idx % len(line_styles)]
+            pred_arr = result['pred_arr']
+            times = result['actual_times'] or actual_times_ref
+
+            legend_base = f'{result["plan_name"]} [曝气{result["aeration"]:.0f},回流{result["return_ratio"]:.0f}%,碳源{result["carbon"]:.0f}]'
+
+            for i, (key, disp_name, sym) in enumerate(indicator_meta):
+                if pred_arr.shape[1] <= i:
+                    continue
+                vals = pred_arr[:, i]
+                std = standards[key]
+
+                normal_vals = np.where(vals <= std, vals, np.nan)
+                exceed_vals = np.where(vals > std, vals, np.nan)
+
+                fig.add_trace(go.Scatter(
+                    x=times, y=normal_vals, mode='lines+markers',
+                    name=f'{legend_base} · {disp_name}',
+                    line=dict(color=color, width=2, dash=dash_style),
+                    marker=dict(size=5, symbol=sym),
+                    legendgroup=f'plan-{result["plan_id"]}',
+                    connectgaps=True,
+                    opacity=0.9,
+                ))
+                fig.add_trace(go.Scatter(
+                    x=times, y=exceed_vals, mode='markers',
+                    name=f'{legend_base} · {disp_name} (超标)',
+                    marker=dict(size=8, symbol='x', color=color,
+                                line=dict(width=1, color='#333')),
+                    legendgroup=f'plan-{result["plan_id"]}',
+                    showlegend=False,
+                    opacity=1.0,
+                ))
+
+        for key, disp_name, _ in indicator_meta:
+            std = standards[key]
+            fig.add_hline(y=std, line_dash='dash', line_color='grey', opacity=0.5,
+                          annotation_text=f'{disp_name}国标{std}',
+                          annotation_position='top right', annotation_font_size=10)
+
+        if len(actual_times_ref) >= 2:
+            shock_end_time = actual_times_ref[0] + timedelta(hours=duration_ref)
+            fig.add_vrect(
+                x0=actual_times_ref[0], x1=shock_end_time,
+                fillcolor='#e74c3c', opacity=0.08,
+                layer='below', line_width=0,
+                annotation_text='冲击时段', annotation_position='top left',
+                annotation_font_color='#d62728', annotation_font_size=11
+            )
+
+        fig.update_layout(
+            title='多方案对比 — 出水COD/TN/TP预测轨迹叠加',
+            template='plotly_white', hovermode='x unified',
+            legend=dict(orientation='h', yanchor='bottom', y=-0.4, xanchor='center', x=0.5,
+                        font=dict(size=10)),
+            yaxis_title='浓度 (mg/L)',
+            margin=dict(l=60, r=20, t=80, b=260),
+            xaxis_tickangle=45,
+            height=450,
+        )
+
+        table_data = []
+        for rank, result in enumerate(all_results, start=1):
+            table_data.append({
+                'rank': rank,
+                'plan_name': result['plan_name'],
+                'aeration': f'{result["aeration"]:.0f}',
+                'return_ratio': f'{result["return_ratio"]:.0f}',
+                'carbon': f'{result["carbon"]:.0f}',
+                'max_exceed_pct': f'{result["max_exceed_pct"]:.2f}',
+                'exceed_hours': result['exceed_hours'],
+                'total_energy': f'{result["total_energy"]:.2f}',
+            })
+
+        best_plan = all_results[0]
+        worst_plan = all_results[-1]
+
+        status = html.Div([
+            html.P(f'✅ 多方案对比完成（共{plan_count}组方案）', className='text-success fw-bold', style={'margin': '2px 0'}),
+            html.P([
+                '🏆 推荐方案: ',
+                html.B(best_plan["plan_name"]),
+                f' — 最大超标幅度 {best_plan["max_exceed_pct"]:.2f}%，超标时长 {best_plan["exceed_hours"]}h，总能耗 {best_plan["total_energy"]:.2f} kWh',
+            ], className='mb-1', style={'fontSize': '13px'}),
+            html.P(f'⚡ 能耗范围: {min(r["total_energy"] for r in all_results):.1f} ~ {max(r["total_energy"] for r in all_results):.1f} kWh',
+                   className='text-muted mb-0', style={'fontSize': '12px'}),
+        ])
+        if best_plan["plan_id"] != worst_plan["plan_id"]:
+            status.children.append(html.P(
+                f'📊 方案超标幅度差: 最优 {best_plan["plan_name"]}({best_plan["max_exceed_pct"]:.1f}%) vs 最差 {worst_plan["plan_name"]}({worst_plan["max_exceed_pct"]:.1f}%)，差距 {worst_plan["max_exceed_pct"]-best_plan["max_exceed_pct"]:.1f}个百分点',
+                className='text-muted mb-0', style={'fontSize': '12px'}
+            ))
+
+        return status, fig, table_data
+
+    except Exception as e:
+        import traceback
+        return html.Div(f'❌ 多方案对比出错: {str(e)}<br><pre>{traceback.format_exc()}</pre>',
+                        className='text-danger'), go.Figure(), []
 
 
 if __name__ == '__main__':
